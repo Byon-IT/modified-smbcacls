@@ -1,3 +1,12 @@
+Modifications
+-------------
+The Samba smbcacls utility to:
+1. Print SID numbers alongside the actual full user & domain names
+
+2. It will store a cache file at /tmp/smb_sid_cache.data and keep the most recent 1000 SID -> full name resolutions in the cache.
+So if these SIDs were seen before - the utility will resolve them to names immediately without any network requests.
+
+
 About Samba
 ===========
 

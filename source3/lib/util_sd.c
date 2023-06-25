@@ -21,6 +21,7 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <string.h>
 #include "includes.h"
 #include "libsmb/libsmb.h"
 #include "util_sd.h"
@@ -29,6 +30,123 @@
 #include "rpc_client/cli_pipe.h"
 #include "rpc_client/cli_lsarpc.h"
 #include "lib/util/string_wrappers.h"
+
+// CAHCING MECHANISM BEGIN
+#include <stdbool.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/file.h>
+
+// Path for persistent cache storage:
+#define CACHE_FILE_PATH "/tmp/smb_sid_cache.data"
+// Cache data structure max records:
+#define CACHE_SIZE 1000
+
+// Define a structure for the SID cache entry
+typedef struct {
+    char sid[250];
+    char name[110];
+    char domain[64];
+	time_t timestamp; 
+
+} SidCacheEntry;
+
+// Define the cache size and initialize an array to store cache entries
+static SidCacheEntry sidCache[CACHE_SIZE];
+
+// Helper function to read the cache data from file
+bool readCacheFromFile()
+{
+    int fd = open(CACHE_FILE_PATH, O_RDONLY);
+    if (fd == -1) {
+		printf("Persistent cache file could not be opened, no cache loaded\n");
+        return false;
+    }
+
+    if (flock(fd, LOCK_SH) == -1) {
+        close(fd);
+        return false;
+    }
+
+    bool success = false;
+    ssize_t bytesRead = read(fd, sidCache, sizeof(sidCache));
+    if (bytesRead == sizeof(sidCache)) {
+        success = true;
+    }
+
+    flock(fd, LOCK_UN);
+    close(fd);
+
+    return success;
+}
+
+// Helper function to write the cache data to file
+bool writeCacheToFile()
+{
+    int fd = open(CACHE_FILE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd == -1) {
+        return false;
+    }
+
+    if (flock(fd, LOCK_EX) == -1) {
+        close(fd);
+        return false;
+    }
+
+    ssize_t bytesWritten = write(fd, sidCache, sizeof(sidCache));
+    bool success = (bytesWritten == sizeof(sidCache));
+
+    flock(fd, LOCK_UN);
+    close(fd);
+
+    return success;
+}
+
+// Helper function to retrieve the name and domain from the cache
+bool getCachedName(const char *sid, char *name, char *domain)
+{
+	readCacheFromFile();
+    for (int i = 0; i < CACHE_SIZE; i++) {
+		if (sidCache[i].sid == NULL) {
+			return false;
+		}
+        if (!strcmp(sid, sidCache[i].sid)) {
+			fstrcpy(name, sidCache[i].name);
+			fstrcpy(domain, sidCache[i].domain);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Helper function to add a name and domain to the cache
+void addToCache(const char *sid, const char *name, const char *domain)
+{
+    // Find an empty cache slot or replace the oldest entry
+    int oldestIndex = 0;
+    time_t oldestTime = time(NULL);
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        if (sidCache[i].name == NULL) {
+            oldestIndex = i;
+            break;
+        }
+        if (sidCache[i].timestamp < oldestTime) {
+            oldestIndex = i;
+            oldestTime = sidCache[i].timestamp;
+        }
+    }
+
+    // Store the new entry in the cache
+	fstrcpy(sidCache[oldestIndex].sid, sid);
+	fstrcpy(sidCache[oldestIndex].name, name);
+	fstrcpy(sidCache[oldestIndex].domain, domain);
+	sidCache[oldestIndex].timestamp = time(NULL); // Set the current timestamp
+
+	writeCacheToFile();
+}
+
+// CACHING MECHANISM END
+
 
 /* These values discovered by inspection */
 
@@ -137,35 +255,52 @@ static NTSTATUS cli_lsa_lookup_sid(struct cli_state *cli,
 	return status;
 }
 
-/* convert a SID to a string, either numeric or username/group */
-void SidToString(struct cli_state *cli, fstring str, const struct dom_sid *sid,
-		 bool numeric)
+/* Convert a SID to a string, either numeric or username/group */
+void SidToString(struct cli_state *cli, fstring str, const struct dom_sid *sid, bool numeric)
 {
-	char *domain = NULL;
-	char *name = NULL;
-	enum lsa_SidType type;
-	NTSTATUS status;
+    char *domain = NULL;
+    char *name = NULL;
+	char cached_domain[250];
+	char cached_name[250];
+	char formatted_sid[250];
+    enum lsa_SidType type;
+    NTSTATUS status;
 
-	sid_to_fstring(str, sid);
+    sid_to_fstring(str, sid);
 
-	if (numeric || cli == NULL) {
-		return;
-	}
+	fstrcpy(formatted_sid, str);
 
-	status = cli_lsa_lookup_sid(cli, sid, talloc_tos(), &type,
-				    &domain, &name);
+    if (numeric || cli == NULL) {
+        return;
+    }
 
-	if (!NT_STATUS_IS_OK(status)) {
-		return;
-	}
+	// Check the cache for the SID-to-name mapping
+	if (getCachedName(formatted_sid, &cached_name, &cached_domain)) {
+        if (*cached_domain) {
+            slprintf(str, sizeof(fstring) - 1, "%s%s%s | %s", cached_domain, lp_winbind_separator(), cached_name, formatted_sid);
+        } else {
+            slprintf(str, sizeof(fstring) - 1, "%s | %s", cached_name, formatted_sid);
+        }
+        return;
+    }
+    status = cli_lsa_lookup_sid(cli, sid, talloc_tos(), &type, &domain, &name);
 
-	if (*domain) {
-		slprintf(str, sizeof(fstring) - 1, "%s%s%s",
-			domain, lp_winbind_separator(), name);
-	} else {
-		fstrcpy(str, name);
-	}
+    if (!NT_STATUS_IS_OK(status)) {
+        return;
+    }
+ 
+	addToCache(formatted_sid, name, domain);
+
+    if (*domain) {
+        slprintf(str, sizeof(fstring) - 1, "%s%s%s | %s", domain, lp_winbind_separator(), name, formatted_sid);
+    } else {
+        slprintf(str, sizeof(fstring) - 1, "%s | %s", name, formatted_sid);
+    }
+
+	writeCacheToFile();
+
 }
+
 
 static NTSTATUS cli_lsa_lookup_name(struct cli_state *cli,
 				    const char *name,
